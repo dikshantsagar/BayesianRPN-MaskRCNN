@@ -57,8 +57,8 @@ class GeneralizedRCNN(nn.Module):
         super().__init__()
 
         self.backbone = backbone
-        for param in self.backbone.parameters():        #freezing backbone
-            param.requires_grad = False
+        #for param in self.backbone.parameters():        #freezing backbone
+         #   param.requires_grad = False
 
         self.proposal_generator = proposal_generator
         self.roi_heads = roi_heads

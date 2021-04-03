@@ -92,6 +92,7 @@ class FastRCNNConvFCHead(nn.Sequential):
         }
 
     def forward(self, x):
+        #print('in box head')
         for layer in self:
             x = layer(x)
         return x

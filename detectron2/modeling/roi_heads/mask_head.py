@@ -27,6 +27,53 @@ per-region features.
 The registered object will be called with `obj(cfg, input_shape)`.
 """
 
+def dice_coe(output, target, loss_type='jaccard', axis=(1, 2), smooth=1e-5):
+    """Soft dice (Sørensen or Jaccard) coefficient for comparing the similarity
+    of two batch of data, usually be used for binary image segmentation
+    i.e. labels are binary. The coefficient between 0 to 1, 1 means totally match.
+
+    Parameters
+    -----------
+    output : Tensor
+        A distribution with shape: [batch_size, ....], (any dimensions).
+    target : Tensor
+        The target distribution, format the same with `output`.
+    loss_type : str
+        ``jaccard`` or ``sorensen``, default is ``jaccard``.
+    axis : tuple of int
+        All dimensions are reduced, default ``[1,2,3]``.
+    smooth : float
+        This small value will be added to the numerator and denominator.
+            - If both output and target are empty, it makes sure dice is 1.
+            - If either output or target are empty (all pixels are background), dice = ```smooth/(small_value + smooth)``,
+             then if smooth is very small, dice close to 0 (even the image values lower than the threshold), so in this case, higher smooth can have a higher dice.
+
+    References
+    -----------
+    - `Wiki-Dice <https://en.wikipedia.org/wiki/Sørensen–Dice_coefficient>`__
+
+    """
+    inse = torch.mean(output * target, dim=axis)
+    if loss_type == 'jaccard':
+        l = torch.mean(output * output, dim=axis)
+        r = torch.mean(target * target, dim=axis)
+    elif loss_type == 'sorensen':
+        l = torch.mean(output, dim=axis)
+        r = torch.mean(target, dim=axis)
+    else:
+        raise Exception("Unknow loss_type")
+    # old axis=[0,1,2,3]
+    # dice = 2 * (inse) / (l + r)
+    # epsilon = 1e-5
+    # dice = tf.clip_by_value(dice, 0, 1.0-epsilon) # if all empty, dice = 1
+    # new haodong
+    dice = (2. * inse + smooth) / (l + r + smooth)
+    ##
+    dice = torch.mean(dice)
+    return dice
+
+
+
 
 @torch.jit.unused
 def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], vis_period: int = 0):
@@ -47,6 +94,7 @@ def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], v
     Returns:
         mask_loss (Tensor): A scalar tensor containing the loss.
     """
+    #print(torch.any(pred_mask_logits<0))
     cls_agnostic_mask = pred_mask_logits.size(1) == 1
     total_num_masks = pred_mask_logits.size(0)
     mask_side_len = pred_mask_logits.size(2)
@@ -107,8 +155,11 @@ def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], v
             vis_mask = torch.stack([vis_mask] * 3, axis=0)
             storage.put_image(name + f" ({idx})", vis_mask)
 
-    mask_loss = F.binary_cross_entropy_with_logits(pred_mask_logits, gt_masks, reduction="mean")
-    return mask_loss
+
+    #mask_loss = F.binary_cross_entropy_with_logits(pred_mask_logits, gt_masks, reduction="mean")
+    pred_mask_logits = torch.sigmoid(pred_mask_logits)
+    mask_loss = dice_coe(pred_mask_logits, gt_masks)
+    return mask_loss * -1
 
 
 def mask_rcnn_inference(pred_mask_logits: torch.Tensor, pred_instances: List[Instances]):
@@ -142,6 +193,7 @@ def mask_rcnn_inference(pred_mask_logits: torch.Tensor, pred_instances: List[Ins
         num_masks = pred_mask_logits.shape[0]
         class_pred = cat([i.pred_classes for i in pred_instances])
         indices = torch.arange(num_masks, device=class_pred.device)
+        #print(pred_mask_logits.shape)
         mask_probs_pred = pred_mask_logits[indices, class_pred][:, None].sigmoid()
     # mask_probs_pred.shape: (B, 1, Hmask, Wmask)
 
@@ -158,15 +210,17 @@ class BaseMaskRCNNHead(nn.Module):
     """
 
     @configurable
-    def __init__(self, *, vis_period=0):
+    def __init__(self, *, loss_weight: float = 1.0, vis_period: int = 0):
         """
         NOTE: this interface is experimental.
 
         Args:
+            loss_weight (float): multiplier of the loss
             vis_period (int): visualization period
         """
         super().__init__()
         self.vis_period = vis_period
+        self.loss_weight = loss_weight
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -188,7 +242,7 @@ class BaseMaskRCNNHead(nn.Module):
         """
         x = self.layers(x)
         if self.training:
-            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period)}
+            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period) * self.loss_weight}
         else:
             mask_rcnn_inference(x, instances)
             return instances
@@ -279,6 +333,7 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
     def layers(self, x):
         for layer in self:
             x = layer(x)
+        #print(torch.any(x<0))
         return x
 
 

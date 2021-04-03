@@ -38,7 +38,7 @@ from detectron2.evaluation import (
     verify_results,
 )
 from detectron2.modeling import GeneralizedRCNNWithTTA
-
+#from detectron2.modeling.proposal_generator.rpn import Model
 
 class Trainer(DefaultTrainer):
     """
@@ -130,15 +130,17 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
-        model = Trainer.build_model(cfg)
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
-        )
-        res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(cfg, model))
-        if comm.is_main_process():
-            verify_results(cfg, res)
+        with torch.no_grad():
+            model = Trainer.build_model(cfg)
+        
+            DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+                cfg.MODEL.WEIGHTS, resume=args.resume
+            )
+            res = Trainer.test(cfg, model)
+            if cfg.TEST.AUG.ENABLED:
+                res.update(Trainer.test_with_TTA(cfg, model))
+            if comm.is_main_process():
+                verify_results(cfg, res)
         return res
 
     """

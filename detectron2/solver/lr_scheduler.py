@@ -227,6 +227,7 @@ def _get_warmup_factor_at_iter(
     Returns:
         float: the effective warmup factor at the given iteration.
     """
+    warmup_iters == 0
     if iter >= warmup_iters:
         return 1.0
 

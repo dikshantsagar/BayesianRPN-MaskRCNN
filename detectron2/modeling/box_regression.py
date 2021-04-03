@@ -6,6 +6,11 @@ from fvcore.nn import giou_loss, smooth_l1_loss
 
 from detectron2.layers import cat
 from detectron2.structures import Boxes
+from torch.distributions.normal import Normal
+
+import numpy as np
+from  torch.distributions.normal import Normal
+import uuid
 
 # Value for clamping large dw and dh predictions. The heuristic is that we clamp
 # such that dw and dh are no larger than what would transform a 16px box into a
@@ -107,12 +112,12 @@ class Box2BoxTransform(object):
         pred_w = torch.exp(dw) * widths[:, None]
         pred_h = torch.exp(dh) * heights[:, None]
 
-        pred_boxes = torch.zeros_like(deltas)
-        pred_boxes[:, 0::4] = pred_ctr_x - 0.5 * pred_w  # x1
-        pred_boxes[:, 1::4] = pred_ctr_y - 0.5 * pred_h  # y1
-        pred_boxes[:, 2::4] = pred_ctr_x + 0.5 * pred_w  # x2
-        pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h  # y2
-        return pred_boxes
+        x1 = pred_ctr_x - 0.5 * pred_w
+        y1 = pred_ctr_y - 0.5 * pred_h
+        x2 = pred_ctr_x + 0.5 * pred_w
+        y2 = pred_ctr_y + 0.5 * pred_h
+        pred_boxes = torch.stack((x1, y1, x2, y2), dim=-1)
+        return pred_boxes.reshape(deltas.shape)
 
 
 @torch.jit.script
@@ -252,12 +257,27 @@ def _dense_box_regression_loss(
     if box_reg_loss_type == "smooth_l1":
         gt_anchor_deltas = [box2box_transform.get_deltas(anchors, k) for k in gt_boxes]
         gt_anchor_deltas = torch.stack(gt_anchor_deltas)  # (N, R, 4)
-        loss_box_reg = smooth_l1_loss(
-            cat(pred_anchor_deltas, dim=1)[fg_mask],
-            gt_anchor_deltas[fg_mask],
-            beta=smooth_l1_beta,
-            reduction="sum",
-        )
+        N = gt_anchor_deltas.shape[0]
+        gt_anchor_deltas = gt_anchor_deltas[fg_mask]
+        #print(pred_anchor_deltas[0].shape)
+        pred_anchor_deltas = cat(pred_anchor_deltas, dim=1)[fg_mask]
+        #print(pred_anchor_deltas.shape)
+        
+        resp_anchors = anchors.expand(N, -1, -1)[fg_mask]
+        #rpndata = torch.cat([resp_anchors,pred_anchor_deltas,gt_anchor_deltas], dim = 1)
+        #filename = str(uuid.uuid4())
+        #torch.save(rpndata,'/projects/iiitd/mrcnn/pretrained/rpndata/'+filename+'.pt')
+ 
+        xnorm = Normal(torch.flatten(pred_anchor_deltas[:,0]),torch.flatten(pred_anchor_deltas[:,4]))
+        ynorm = Normal(torch.flatten(pred_anchor_deltas[:,1]),torch.flatten(pred_anchor_deltas[:,5]))
+        wnorm = Normal(torch.flatten(pred_anchor_deltas[:,2]),torch.flatten(pred_anchor_deltas[:,6]))
+        hnorm = Normal(torch.flatten(pred_anchor_deltas[:,3]),torch.flatten(pred_anchor_deltas[:,7]))
+
+        x,y,w,h = torch.flatten(gt_anchor_deltas[:,0]), torch.flatten(gt_anchor_deltas[:,1]), torch.flatten(gt_anchor_deltas[:,2]), torch.flatten(gt_anchor_deltas[:,3])
+        loss_box_reg = -xnorm.log_prob(x) -ynorm.log_prob(y) -wnorm.log_prob(w) -hnorm.log_prob(h)
+        loss_box_reg = torch.mean(loss_box_reg) 
+
+
     elif box_reg_loss_type == "giou":
         pred_boxes = [
             box2box_transform.apply_deltas(k, anchors) for k in cat(pred_anchor_deltas, dim=1)
@@ -268,3 +288,4 @@ def _dense_box_regression_loss(
     else:
         raise ValueError(f"Invalid dense box regression loss type '{box_reg_loss_type}'")
     return loss_box_reg
+

@@ -96,7 +96,7 @@ class ROIAlign(nn.Module):
         self.sampling_ratio = sampling_ratio
         self.aligned = aligned
 
-    def forward(self, input, rois, spatial_scale):
+    def forward(self, input, rois):
         """
         Args:
             input: NCHW images
@@ -107,7 +107,7 @@ class ROIAlign(nn.Module):
             input,
             rois.to(dtype=input.dtype),
             self.output_size,
-            spatial_scale,
+            self.spatial_scale,
             self.sampling_ratio,
             self.aligned,
         )

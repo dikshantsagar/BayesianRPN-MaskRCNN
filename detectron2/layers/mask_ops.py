@@ -100,10 +100,10 @@ def paste_masks_in_image(
         and height. img_masks[i] is a binary mask for object instance i.
     """
 
-    assert masks.shape[-1] == masks.shape[-2], "Only square mask predictions are supported"
+    #assert masks.shape[-1] == masks.shape[-2], "Only square mask predictions are supported"
     N = len(masks)
     if N == 0:
-        return masks.new_empty((0,) + image_shape, dtype=torch.uint8)
+        return torch.randn((0,) + image_shape)
     if not isinstance(boxes, torch.Tensor):
         boxes = boxes.tensor
     device = boxes.device
@@ -129,21 +129,25 @@ def paste_masks_in_image(
     img_masks = torch.zeros(
         N, img_h, img_w, device=device, dtype=torch.bool if threshold >= 0 else torch.uint8
     )
+    #print(chunks)
     for inds in chunks:
-        masks_chunk, spatial_inds = _do_paste_mask(
-            masks[inds, None, :, :], boxes[inds], img_h, img_w, skip_empty=device.type == "cpu"
-        )
 
-        if threshold >= 0:
-            masks_chunk = (masks_chunk >= threshold).to(dtype=torch.bool)
-        else:
+        for ind in inds:
+            #print(masks[ind][None, :, :].shape, boxes[ind].unsqueeze(0).shape)
+            masks_chunk, spatial_inds = _do_paste_mask(
+                masks[ind][None, :, :].unsqueeze(0), boxes[ind].unsqueeze(0),img_h, img_w, skip_empty=device.type == "cpu"
+            )
+
+            if threshold >= 0:
+                masks_chunk = (masks_chunk >= threshold).to(dtype=torch.bool)
+            else:
             # for visualization and debugging
-            masks_chunk = (masks_chunk * 255).to(dtype=torch.uint8)
-
-        if torch.jit.is_scripting():  # Scripting does not use the optimized codepath
-            img_masks[inds] = masks_chunk
-        else:
-            img_masks[(inds,) + spatial_inds] = masks_chunk
+                masks_chunk = (masks_chunk * 255).to(dtype=torch.uint8)
+            
+            if torch.jit.is_scripting():  # Scripting does not use the optimized codepath
+                img_masks[ind] = masks_chunk
+            else:
+                img_masks[(ind,) + spatial_inds] = masks_chunk
     return img_masks
 
 

@@ -17,6 +17,9 @@ from ..matcher import Matcher
 from ..sampling import subsample_labels
 from .build import PROPOSAL_GENERATOR_REGISTRY
 from .proposal_utils import find_top_rpn_proposals
+import numpy as np
+
+from torch.distributions.normal import Normal
 
 RPN_HEAD_REGISTRY = Registry("RPN_HEAD")
 RPN_HEAD_REGISTRY.__doc__ = """
@@ -93,7 +96,7 @@ class StandardRPNHead(nn.Module):
         # 1x1 conv for predicting objectness logits
         self.objectness_logits = nn.Conv2d(in_channels, num_anchors, kernel_size=1, stride=1)
         # 1x1 conv for predicting box2box transform deltas
-        self.anchor_deltas = nn.Conv2d(in_channels, num_anchors * box_dim, kernel_size=1, stride=1)
+        self.anchor_deltas = nn.Conv2d(in_channels, num_anchors * box_dim * 2 , kernel_size=1, stride=1)
 
         for l in [self.conv, self.objectness_logits, self.anchor_deltas]:
             nn.init.normal_(l.weight, std=0.01)
@@ -132,10 +135,31 @@ class StandardRPNHead(nn.Module):
         pred_objectness_logits = []
         pred_anchor_deltas = []
         for x in features:
-            t = F.relu(self.conv(x))
+            #t = F.relu(self.conv(x))
+            t = self.conv(x)
             pred_objectness_logits.append(self.objectness_logits(t))
             pred_anchor_deltas.append(self.anchor_deltas(t))
         return pred_objectness_logits, pred_anchor_deltas
+
+
+class Model(torch.nn.Module):
+
+    def __init__(self,in_dim,h_dim):
+
+        super(Model, self).__init__()
+        self.layer1 = torch.nn.Linear(in_dim,h_dim)
+        self.layer2 = torch.nn.Linear(h_dim,4)
+        for l in [self.layer1, self.layer2]:
+            nn.init.normal_(l.weight, std=0.01)
+            nn.init.constant_(l.bias, 0)
+
+    def forward(self,x):
+
+        x = self.layer1(x)
+        x = torch.tanh(x)
+        x = self.layer2(x)
+
+        return x
 
 
 @PROPOSAL_GENERATOR_REGISTRY.register()
@@ -215,6 +239,9 @@ class RPN(nn.Module):
         self.loss_weight = loss_weight
         self.box_reg_loss_type = box_reg_loss_type
         self.smooth_l1_beta = smooth_l1_beta
+        self.rpn_aux = Model(8,16) #torch.load("/projects/iiitd/mrcnn/pretrained/rpn.pth")
+        #Model(8,16)
+        #torch.load("/projects/iiitd/mrcnn/pretrained/rpn.pth")
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -417,24 +444,54 @@ class RPN(nn.Module):
             score.permute(0, 2, 3, 1).flatten(1)
             for score in pred_objectness_logits
         ]
-        pred_anchor_deltas = [
+        
+        pred_anchor_deltas_mu = [
             # (N, A*B, Hi, Wi) -> (N, A, B, Hi, Wi) -> (N, Hi, Wi, A, B) -> (N, Hi*Wi*A, B)
-            x.view(x.shape[0], -1, self.anchor_generator.box_dim, x.shape[-2], x.shape[-1])
+            F.relu(x.view(x.shape[0], -1, self.anchor_generator.box_dim * 2, x.shape[-2], x.shape[-1])
             .permute(0, 3, 4, 1, 2)
-            .flatten(1, -2)
+    .flatten(1, -2)[:,:,:4])
             for x in pred_anchor_deltas
         ]
+        pred_anchor_deltas_sig = [
+            # (N, A*B, Hi, Wi) -> (N, A, B, Hi, Wi) -> (N, Hi, Wi, A, B) -> (N, Hi*Wi*A, B)
+            x.view(x.shape[0], -1, self.anchor_generator.box_dim * 2, x.shape[-2], x.shape[-1])
+            .permute(0, 3, 4, 1, 2)
+            .flatten(1, -2)[:,:,4:8]
+            for x in pred_anchor_deltas
+        ]
+        eps = 1e-10
+
+        dist = []
+        pred = []
+        for mu,sig in zip(pred_anchor_deltas_mu,pred_anchor_deltas_sig):
+            batch = []
+            pred_batch =[]
+            for i,j in zip(mu,sig):
+                xmu,ymu,wmu,hmu = i[:,0], i[:,1], i[:,2], i[:,3]
+                xsig,ysig,wsig,hsig = j[:,0], j[:,1], j[:,2], j[:,3]
+                xnorm = Normal(torch.flatten(xmu),torch.flatten(torch.exp(xsig + eps)))
+                ynorm = Normal(torch.flatten(ymu),torch.flatten(torch.exp(ysig + eps)))
+                wnorm = Normal(torch.flatten(wmu),torch.flatten(torch.exp(wsig + eps)))
+                hnorm = Normal(torch.flatten(hmu),torch.flatten(torch.exp(hsig + eps)))
+                inp = torch.cat([xnorm.loc.view(-1,1),ynorm.loc.view(-1,1),wnorm.loc.view(-1,1),hnorm.loc.view(-1,1),xnorm.scale.view(-1,1),ynorm.scale.view(-1,1),wnorm.scale.view(-1,1),hnorm.scale.view(-1,1)],dim=1)
+                batch.append(inp)
+                pred_batch.append(torch.tanh(self.rpn_aux(inp.detach()))*inp[:,4:])
+            dist.append(torch.stack(batch,dim=0))
+            pred.append(torch.stack(pred_batch, dim=0))
+        
 
         if self.training:
             assert gt_instances is not None, "RPN requires gt_instances in training!"
             gt_labels, gt_boxes = self.label_and_sample_anchors(anchors, gt_instances)
             losses = self.losses(
-                anchors, pred_objectness_logits, gt_labels, pred_anchor_deltas, gt_boxes
+                anchors, pred_objectness_logits, gt_labels, dist, gt_boxes
             )
         else:
             losses = {}
+        
+    
         proposals = self.predict_proposals(
-            anchors, pred_objectness_logits, pred_anchor_deltas, images.image_sizes
+            anchors, pred_objectness_logits, pred, images.image_sizes
         )
         return proposals, losses
 
@@ -490,3 +547,4 @@ class RPN(nn.Module):
             # Append feature map proposals with shape (N, Hi*Wi*A, B)
             proposals.append(proposals_i.view(N, -1, B))
         return proposals
+

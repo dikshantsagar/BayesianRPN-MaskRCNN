@@ -591,6 +591,8 @@ def build_augmentation(cfg, is_train):
                 vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
             )
         )
+        #augmentation.append(T.RandomCrop("absolute", (800, 800))) 
+        #augmentation.append(T.RandomExtent((0.3,1,5),(0.2,0.2)))
     return augmentation
 
 

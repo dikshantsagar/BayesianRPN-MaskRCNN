@@ -1,6 +1,6 @@
 _BASE_: "../Base-RCNN-FPN.yaml"
 MODEL:
-  WEIGHTS: "/projects/iiitd/mrcnn/pretrained/model_final_a54504.pkl"
+  WEIGHTS: "/projects/iiitd/mrcnn/pretrained/model_final_f10217.pkl"
   MASK_ON: True
   RESNETS:
     DEPTH: 50

@@ -109,7 +109,6 @@ class ROIPooler(nn.Module):
         pooler_type,
         canonical_box_size=224,
         canonical_level=4,
-        fixed=True,
     ):
         """
         Args:
@@ -117,7 +116,7 @@ class ROIPooler(nn.Module):
                 e.g., 14 x 14. If tuple or list is given, the length must be 2.
             scales (list[float]): The scale for each low-level pooling op relative to
                 the input image. For a feature map with stride s relative to the input
-                image, scale is defined as a 1 / s. The stride must be power of 2.
+                image, scale is defined as 1/s. The stride must be power of 2.
                 When there are multiple scales, they must form a pyramid, i.e. they must be
                 a monotically decreasing geometric sequence with a factor of 1/2.
             sampling_ratio (int): The `sampling_ratio` parameter for the ROIAlign op.
@@ -144,13 +143,6 @@ class ROIPooler(nn.Module):
         assert len(output_size) == 2
         assert isinstance(output_size[0], int) and isinstance(output_size[1], int)
         self.output_size = output_size
-        self.fixed = fixed
-
-        self.inlayer = nn.Conv2d(256, 256*2, kernel_size=(1,1), padding=0)
-        self.reclayer = nn.Conv2d(256, 256*2, kernel_size=(3,3), stride=(2,2), padding=0)
-        self.outlayer = nn.Conv2d(256*2, 256, kernel_size=(1,1))
-        
-        self.var_outlayer = nn.Conv2d(256,256, kernel_size=(2,2), stride=(1,1))
 
         if pooler_type == "ROIAlign":
             self.level_poolers = nn.ModuleList(
@@ -245,81 +237,14 @@ class ROIPooler(nn.Module):
         output_size = self.output_size[0]
 
         dtype, device = x[0].dtype, x[0].device
-        output = torch.zeros((num_boxes, num_channels, output_size, output_size), dtype=dtype, device=device)
+        output = torch.zeros(
+            (num_boxes, num_channels, output_size, output_size), dtype=dtype, device=device
+        )
 
         for level, pooler in enumerate(self.level_poolers):
             inds = nonzero_tuple(level_assignments == level)[0]
+            pooler_fmt_boxes_level = pooler_fmt_boxes[inds]
+            # Use index_put_ instead of advance indexing, to avoid pytorch/issues/49852
+            output.index_put_((inds,), pooler(x[level], pooler_fmt_boxes_level))
 
-            boxes = pooler_fmt_boxes[inds]
-            scale = pooler.spatial_scale
-            boxes[:,1:3] = torch.floor(boxes[:,1:3]*scale)
-            boxes[:,3:5] = torch.ceil(boxes[:,3:5]*scale)
-            boxes = boxes.to(device=device,dtype=torch.long)
-
-            feats = x[level]
-
-            # replacing the below for loop
-            boxes[boxes[:,1]< 0,1] = 0
-            boxes[boxes[:,2]< 0,2] = 0
-            
-            boxes[boxes[:,3] >= feats[0].shape[-1],3] = feats[0].shape[-1]-1
-            boxes[boxes[:,4] >= feats[0].shape[-2],4] = feats[0].shape[-2]-1
-            mask = torch.logical_and((boxes[:,3]-boxes[:,1]) > 1,(boxes[:,4]-boxes[:,2]) > 1)
-            boxes=boxes[mask]
-            if boxes.shape[0] < 1:
-                continue
-            
-            height = boxes[:,4] - boxes[:,2] + 1
-            width = boxes[:,3] - boxes[:,1] + 1
-            max_h,max_w = torch.max(torch.max(height),0)[0], torch.max(torch.max(width),0)[0]
-            crops = torch.zeros((boxes.shape[0],256,max_h,max_w),device=device,dtype=torch.float32)
-            for i in  range(boxes.shape[0]): 
-                ind,x0,y0,x1,y1 = boxes[i]
-                crops[i,:,:y1-y0+1,:x1-x0+1] = feats[ind][:,y0:y1+1,x0:x1+1]
-            boxes[:,0] = torch.arange(boxes.shape[0]) ## i changes this from 0
-            boxes[:,3:5] -= boxes[:,1:3]
-            boxes[:,1:3] = 0
-            
-            if self.fixed:
-                crops,boxes = self.fixed_learnable_downsample(crops,boxes, out_shape=self.output_size, device=device)
-                output[inds] = pooler(crops,boxes,1.0)
-        
-        output = torch.cat(output,0)
         return output
-    def outShape(self,x,stride,kernel):
-        x_out = torch.floor((x-kernel)/(stride*1.0)+1)
-        return x_out.type(torch.int32)
-    def hwOut(self,hin,win,strides=(1,1),kernel=(3,3)):
-        hout = self.outShape(hin,strides[0],kernel[0])
-        wout = self.outShape(win,strides[1],kernel[1])
-        return hout,wout
-    def rcConv(self,x,box_x):
-        x1 = self.reclayer(x)
-        x1 = self.outlayer(x1)
-        #x1 = padding(x1)
-        box_x[:,-1],box_x[:,-2] = self.hwOut(box_x[:,-1],box_x[:,-2],strides=(2,2),kernel=(3,3))
-        #make box changes
-        return x1,box_x
-    def fixed_learnable_downsample(self, features,boxes, out_shape=(7,7),kernel_size=(3,3),strides=(2,2),device=None):
-        # start edit 3
-        #mask_omit = torch.ones((boxes.shape[0]),dtype=torch.bool,device=device)
-        result_x = torch.zeros(features.size(),dtype=torch.float,device=device)
-        result_box = torch.zeros(boxes.size(),device=device,dtype=torch.long)
-        #N,c,m,n = features.shape
-        features_ = features
-        boxes_ = boxes
-        indexes = torch.arange(boxes.shape[0])
-        while indexes.shape[0]>0:
-            mask = torch.logical_and(
-                self.outShape(boxes_[:,-1],strides[0],kernel_size[0]) > out_shape[0],
-                self.outShape(boxes_[:,-2],strides[1],kernel_size[1]) > out_shape[1]
-            )
-            mask_not = torch.logical_not(mask)
-            indexes_ = indexes[mask]
-            finalized =  indexes[mask_not]
-            # port finalized to results
-            result_x[finalized,:,:features_.shape[2],:features_.shape[3]] = features_[mask_not,:,:,:]
-            result_box[finalized,:] = boxes_[mask_not,:]
-            features_,boxes_ = self.rcConv(features_[mask],boxes_[mask])
-            indexes = indexes_
-        return result_x,result_box
